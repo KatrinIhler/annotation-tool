@@ -24,6 +24,7 @@ import static org.opencast.annotation.impl.persistence.ScaleValueDto.toScaleValu
 import static org.opencast.annotation.impl.persistence.TrackDto.toTrack;
 import static org.opencast.annotation.impl.persistence.UserDto.toUser;
 import static org.opencast.annotation.impl.persistence.VideoDto.toVideo;
+import static org.opencastproject.db.Queries.namedQuery;
 import static org.opencastproject.util.data.Monadics.mlist;
 import static org.opencastproject.util.data.Option.none;
 import static org.opencastproject.util.data.Option.option;
@@ -57,6 +58,8 @@ import org.opencast.annotation.impl.persistence.util.PersistenceEnv;
 import org.opencast.annotation.impl.persistence.util.PersistenceEnvs;
 import org.opencast.annotation.impl.persistence.util.Queries;
 
+import org.opencastproject.db.DBSession;
+import org.opencastproject.db.DBSessionFactory;
 import org.opencastproject.mediapackage.MediaPackage;
 import org.opencastproject.search.api.SearchQuery;
 import org.opencastproject.search.api.SearchResultItem;
@@ -74,7 +77,9 @@ import org.opencastproject.util.data.Predicate;
 import org.opencastproject.util.data.Tuple;
 import org.opencastproject.util.data.functions.Options;
 
+import org.osgi.service.component.annotations.Activate;
 import org.osgi.service.component.annotations.Component;
+import org.osgi.service.component.annotations.Deactivate;
 import org.osgi.service.component.annotations.Reference;
 
 import java.util.ArrayList;
@@ -97,14 +102,31 @@ import javax.persistence.RollbackException;
 @Component
 public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotationService {
 
-  private PersistenceEnv persistenceEnv;
+  private EntityManagerFactory entityManagerFactory;
+  private DBSessionFactory dbSessionFactory;
+  private DBSession db;
   private SecurityService securityService;
   private AuthorizationService authorizationService;
   private SearchService searchService;
 
+  @Activate
+  public void activate() {
+    db = dbSessionFactory.createSession(entityManagerFactory);
+  }
+
+  @Deactivate
+  public synchronized void deactivate() {
+    db.close();
+  }
+
   @Reference(target = "(osgi.unit.name=org.opencast.annotation.impl.persistence)")
   public void setEntityManagerFactory(EntityManagerFactory entityManagerFactory) {
-    this.persistenceEnv = PersistenceEnvs.persistenceEnvironment(entityManagerFactory);
+    this.entityManagerFactory = entityManagerFactory;
+  }
+
+  @Reference
+  public void setDBSessionFactory(DBSessionFactory dbSessionFactory) {
+    this.dbSessionFactory = dbSessionFactory;
   }
 
   @Reference
@@ -124,17 +146,27 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
 
   /**
    * Run <code>f</code> inside a transaction with exception handling applied.
-   *
-   * @see #exhandler
    */
-  private <A> A tx(Function<EntityManager, A> f) {
-    return persistenceEnv.<A> tx().rethrow(exhandler).apply(f);
+  private <A> A tx(java.util.function.Function<EntityManager, A> f) {
+    try {
+      return db.execTx(f);
+    } catch (Exception e) {
+      if (e instanceof ExtendedAnnotationException) {
+        throw (ExtendedAnnotationException) e;
+      } else if (e instanceof RollbackException) {
+        final Throwable cause = e.getCause();
+        String message = cause.getMessage().toLowerCase();
+        if (message.contains("unique") || message.contains("duplicate"))
+          throw new ExtendedAnnotationException(Cause.DUPLICATE);
+      }
+      throw new ExtendedAnnotationException(Cause.SERVER_ERROR, e);
+    }
   }
 
   @Override
   public User createUser(String extId, String nickname, Option<String> email, Resource resource) {
     final UserDto dto = UserDto.create(extId, nickname, email, resource);
-    return tx(Queries.persist(dto)).toUser();
+    return tx(namedQuery.persist(dto)).toUser();
   }
 
   @Override
@@ -157,26 +189,23 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
 
   @Override
   public boolean clearDatabase() throws ExtendedAnnotationException {
-    return tx(new Function<EntityManager, Boolean>() {
-      @Override
-      public Boolean apply(EntityManager em) {
-        named.update(em, "Annotation.clear");
-        named.update(em, "Track.clear");
-        named.update(em, "User.clear");
-        named.update(em, "Video.clear");
-        named.update(em, "Category.clear");
-        named.update(em, "Label.clear");
-        named.update(em, "Annotation.clear");
-        named.update(em, "Track.clear");
-        named.update(em, "User.clear");
-        named.update(em, "Video.clear");
-        named.update(em, "Category.clear");
-        named.update(em, "Label.clear");
-        named.update(em, "Scale.clear");
-        named.update(em, "ScaleValue.clear");
-        named.update(em, "Comment.clear");
-        return true;
-      }
+    return tx(em -> {
+      namedQuery.update( "Annotation.clear").apply(em);
+      namedQuery.update("Track.clear").apply(em);
+      namedQuery.update("User.clear").apply(em);
+      namedQuery.update("Video.clear").apply(em);
+      namedQuery.update("Category.clear").apply(em);
+      namedQuery.update("Label.clear").apply(em);
+      namedQuery.update("Annotation.clear").apply(em);
+      namedQuery.update("Track.clear").apply(em);
+      namedQuery.update("User.clear").apply(em);
+      namedQuery.update("Video.clear").apply(em);
+      namedQuery.update("Category.clear").apply(em);
+      namedQuery.update("Label.clear").apply(em);
+      namedQuery.update("Scale.clear").apply(em);
+      namedQuery.update("ScaleValue.clear").apply(em);
+      namedQuery.update("Comment.clear").apply(em);
+      return true;
     });
   }
 
@@ -201,7 +230,7 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
   @Override
   public Video createVideo(String extId, Resource resource) throws ExtendedAnnotationException {
     final VideoDto dto = VideoDto.create(extId, resource);
-    return tx(Queries.persist(dto)).toVideo();
+    return tx(namedQuery.persist(dto)).toVideo();
   }
 
   @Override
@@ -257,7 +286,7 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
           final Option<String> settings, final Resource resource) throws ExtendedAnnotationException {
     if (getVideoDto(videoId).isSome()) {
       final TrackDto dto = TrackDto.create(videoId, name, description, settings, resource);
-      return tx(Queries.persist(dto)).toTrack();
+      return tx(namedQuery.persist(dto)).toTrack();
     } else {
       throw notFound;
     }
@@ -266,7 +295,7 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
   @Override
   public Track createTrack(final Track track) throws ExtendedAnnotationException {
     if (getVideoDto(track.getVideoId()).isSome()) {
-      return tx(Queries.persist(TrackDto.fromTrack(track))).toTrack();
+      return tx(namedQuery.persist(TrackDto.fromTrack(track))).toTrack();
     } else {
       throw notFound;
     }
@@ -340,7 +369,7 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
     if (getTrack(trackId).isSome()) {
       final AnnotationDto dto = AnnotationDto.create(trackId, text, start, duration, settings, labelId, scaleValueId,
               resource);
-      return tx(Queries.persist(dto)).toAnnotation();
+      return tx(namedQuery.persist(dto)).toAnnotation();
     } else {
       throw notFound;
     }
@@ -349,7 +378,7 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
   @Override
   public Annotation createAnnotation(final Annotation annotation) throws ExtendedAnnotationException {
     if (getTrackDto(annotation.getTrackId()).isSome()) {
-      return tx(Queries.persist(AnnotationDto.fromAnnotation(annotation))).toAnnotation();
+      return tx(namedQuery.persist(AnnotationDto.fromAnnotation(annotation))).toAnnotation();
     } else {
       throw notFound;
     }
@@ -367,7 +396,11 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
 
   /** Generic update method. */
   private <A> void update(String q, long id, Effect<A> update) {
-    tx(Options.foreach(named.findSingle(q, id(id)), update)).orError(notFound);
+    tx(em -> {
+      A o = (A) namedQuery.find(q, id(id)).apply(em);
+
+      update.apply(o);
+    }).orError(notFound);
   }
 
   @Override
@@ -421,7 +454,7 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
   public Scale createScale(Option<Long> videoId, String name, Option<String> description, Resource resource)
           throws ExtendedAnnotationException {
     final ScaleDto dto = ScaleDto.create(videoId, name, description, resource);
-    return tx(Queries.persist(dto)).toScale();
+    return tx(namedQuery.persist(dto)).toScale();
   }
 
   @Override
@@ -527,7 +560,7 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
           throws ExtendedAnnotationException {
     final ScaleValueDto dto = ScaleValueDto.create(scaleId, name, value, order, resource);
 
-    return tx(Queries.persist(dto)).toScaleValue();
+    return tx(namedQuery.persist(dto)).toScaleValue();
   }
 
   @Override
@@ -561,7 +594,7 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
     final CategoryDto dto = CategoryDto.create(seriesExtId, seriesCategoryId, videoId, scaleId, name, description,
             settings, resource);
 
-    return tx(Queries.persist(dto)).toCategory();
+    return tx(namedQuery.persist(dto)).toCategory();
   }
 
   @Override
@@ -590,7 +623,7 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
         Category category = (Category) tx(new Function<EntityManager, Object>() {
           @Override
           public Object apply(EntityManager em) {
-            return Queries.persist(copyDto).apply(em).toCategory();
+            return namedQuery.persist(copyDto).apply(em).toCategory();
           }
         });
 
@@ -807,13 +840,13 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
       if (seriesCategory.isSome() && categoryId != (seriesCategory.get().getId())) {
         final LabelDto dto = LabelDto.create(none(), categorySeriesCategoryId, value, abbreviation, description,
                 settings, resource);
-        return tx(Queries.persist(dto)).toLabel();
+        return tx(namedQuery.persist(dto)).toLabel();
       }
     }
 
     // Normal Create
     final LabelDto dto = LabelDto.create(none(), categoryId, value, abbreviation, description, settings, resource);
-    return tx(Queries.persist(dto)).toLabel();
+    return tx(namedQuery.persist(dto)).toLabel();
   }
 
   @Override
@@ -884,7 +917,7 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
                           seriesLabel.getCreatedBy(), seriesLabel.getUpdatedBy(), seriesLabel.getDeletedBy(),
                           seriesLabel.getCreatedAt(), seriesLabel.getUpdatedAt(), seriesLabel.getDeletedAt(),
                           seriesLabel.getTags()));
-          newLabels.add(tx(Queries.persist(dto)).toLabel());
+          newLabels.add(tx(namedQuery.persist(dto)).toLabel());
         }
 
         // Return series labels, so that they are updated in the backend
@@ -921,7 +954,7 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
   @Override
   public Comment createComment(long annotationId, Option<Long> replyToId, String text, Resource resource) {
     final CommentDto dto = CommentDto.create(annotationId, text, replyToId, resource);
-    return tx(Queries.persist(dto)).toComment();
+    return tx(namedQuery.persist(dto)).toComment();
   }
 
   @Override
@@ -982,22 +1015,6 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
 
   // --
 
-  /** Transform any exception from the JPA persistence layer into an API exception. */
-  private static final Function<Exception, ExtendedAnnotationException> exhandler = new Function<Exception, ExtendedAnnotationException>() {
-    @Override
-    public ExtendedAnnotationException apply(Exception e) {
-      if (e instanceof ExtendedAnnotationException) {
-        return (ExtendedAnnotationException) e;
-      } else if (e instanceof RollbackException) {
-        final Throwable cause = e.getCause();
-        String message = cause.getMessage().toLowerCase();
-        if (message.contains("unique") || message.contains("duplicate"))
-          return new ExtendedAnnotationException(Cause.DUPLICATE);
-      }
-      return new ExtendedAnnotationException(Cause.SERVER_ERROR, e);
-    }
-  };
-
   private static final ExtendedAnnotationException notFound = new ExtendedAnnotationException(Cause.NOT_FOUND);
 
   /**
@@ -1007,7 +1024,7 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
    *          value of the ":id" parameter in the named query.
    */
   private <A, B> Option<A> findById(final Function<B, A> toA, final String queryName, final Object id) {
-    return tx(named.<B> findSingle(queryName, id(id))).map(toA);
+    return findById(queryName, id).map(toA);
   }
 
   /**
@@ -1017,7 +1034,11 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
    *          value of the ":id" parameter in the named query.
    */
   private <A> Option<A> findById(final String queryName, final Object id) {
-    return tx(named.findSingle(queryName, id(id)));
+    try {
+      return some((A) tx(namedQuery.find(queryName, id(id))));
+    } catch (NoResultException | NonUniqueResultException e) {
+      return none();
+    }
   }
 
   /**
@@ -1275,10 +1296,6 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
    */
   // TODO Why this wrapper ...
   private static class NamedWrapper {
-    @SafeVarargs
-    public final boolean update(EntityManager em, String q, Tuple<String, ?>... params) {
-      return Queries.named.update(em, q, params);
-    }
 
     @SuppressWarnings("SameParameterValue")
     @SafeVarargs
@@ -1289,32 +1306,24 @@ public final class ExtendedAnnotationServiceJpaImpl implements ExtendedAnnotatio
     @SafeVarargs
     final <A> Function<EntityManager, Monadics.ListMonadic<A>> findAllM(String q, Option<Integer> maybeOffset,
             Option<Integer> maybeLimit, Tuple<String, ?>... params) {
+
+      em -> {
+        namedQuery.findAll(q, params).apply(em);
+        for (Integer offset: maybeOffset) query.setFirstResult(offset);
+        for (Integer limit: maybeLimit) query.setMaxResults(limit);
+        @SuppressWarnings("unchecked")
+        List<A> results = query.getResultList();
+        return mlist(results);
+      }
       return new Function<EntityManager, Monadics.ListMonadic<A>>() {
         @Override
         public Monadics.ListMonadic<A> apply(EntityManager entityManager) {
-          Query query = Queries.named.query(entityManager, q, params);
+          Query query = namedQuery.findAll(q, params);
           for (Integer offset: maybeOffset) query.setFirstResult(offset);
           for (Integer limit: maybeLimit) query.setMaxResults(limit);
           @SuppressWarnings("unchecked")
           List<A> results = query.getResultList();
           return mlist(results);
-        }
-      };
-    }
-
-    @SafeVarargs
-    final <A> Function<EntityManager, Option<A>> findSingle(String q, Tuple<String, ?>... params) {
-      return new Function<EntityManager, Option<A>>() {
-        @Override
-        public Option<A> apply(EntityManager entityManager) {
-          try {
-            Query query = Queries.named.query(entityManager, q, params);
-            @SuppressWarnings("unchecked")
-            A result = (A) query.getSingleResult();
-            return some(result);
-          } catch (NoResultException | NonUniqueResultException e) {
-            return none();
-          }
         }
       };
     }
